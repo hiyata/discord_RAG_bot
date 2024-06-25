@@ -1,22 +1,27 @@
 import discord
-import fitz  # PyMuPDF
 import os
-import json
 from dotenv import load_dotenv
-import requests
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-import joblib
+import json
+from embeddings import load_or_create_all_embeddings, get_embedding_from_ollama
+import requests
 
 # Function to load environment variables
 def load_env_variables():
     load_dotenv()
-    global PDF_FILE_PATH, DISCORD_BOT_TOKEN, OLLAMA_API_URL, BLOCKED_USERNAMES, EMBEDDINGS_DIR
+    global PDF_FILE_PATH, DISCORD_BOT_TOKEN, OLLAMA_API_URL, OLLAMA_MODEL_NAME, BLOCKED_USERNAMES, EMBEDDINGS_DIR
     PDF_FILE_PATH = os.getenv('PDF_FILE_PATH')
     DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     OLLAMA_API_URL = os.getenv('OLLAMA_API_URL', 'http://127.0.0.1:11434')
+    OLLAMA_MODEL_NAME = os.getenv('OLLAMA_MODEL_NAME', 'llama3')
     BLOCKED_USERNAMES = os.getenv('BLOCKED_USERNAMES', '').split(',')
     EMBEDDINGS_DIR = 'pdf_chunks'
+
+# Function to load instructions from file
+def load_instructions(file_path):
+    with open(file_path, 'r') as file:
+        return file.read()
 
 # Load initial environment variables
 load_env_variables()
@@ -24,104 +29,21 @@ load_env_variables()
 if not PDF_FILE_PATH or not DISCORD_BOT_TOKEN:
     raise ValueError("One or more environment variables are not set. Please check your .env file.")
 
+# Load instructions
+BOT_INSTRUCTIONS = load_instructions('positive_instructions.txt')
+REFUSAL_PROMPT_TEMPLATE = load_instructions('negative_instructions.txt')
+
 # Initialize the Discord client
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 discord_client = discord.Client(intents=intents)
 
-# Function to extract text from PDF
-def extract_text_from_pdf(pdf_path):
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        return text
-    except Exception as e:
-        print(f"Error opening PDF file: {e}")
-        raise
-
-# Functions to split text
-def split_text_by_sentences(text):
-    import nltk
-    nltk.download('punkt')
-    return nltk.sent_tokenize(text)
-
-def split_text_by_paragraphs(text):
-    return text.split('\n\n')
-
-def split_text_with_overlap(text, chunk_size=1000, overlap=200):
-    words = text.split()
-    return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size - overlap)]
-
-# Function to get embeddings from Ollama
-def get_embedding_from_ollama(text, model_name="llama3"):
-    url = f"{OLLAMA_API_URL}/api/embeddings"
-    headers = {"Content-Type": "application/json"}
-    data = {"model": model_name, "prompt": text}
-    
-    response = requests.post(url, headers=headers, json=data)
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as err:
-        print(f"HTTP error occurred: {err}")
-        raise
-    return response.json()["embedding"]
-
-# Functions to generate, store, and load embeddings
-def generate_embeddings_for_chunks(chunks, model_name="llama3"):
-    embeddings = []
-    for index, chunk in enumerate(chunks):
-        print(f"Processing chunk {index + 1}/{len(chunks)}")
-        try:
-            embedding = get_embedding_from_ollama(chunk, model_name)
-            embeddings.append(embedding)
-        except Exception as e:
-            print(f"Failed to get embedding for chunk {index + 1}: {e}")
-            embeddings.append([0]*768)  # Assuming embedding size is 768, use zeros as placeholder
-        print(f"Completed chunk {index + 1}/{len(chunks)}")
-    return embeddings
-
-def store_embeddings(embeddings, file_path):
-    with open(file_path, 'wb') as file:
-        joblib.dump(embeddings, file)
-
-def load_embeddings(file_path):
-    with open(file_path, 'rb') as file:
-        return joblib.load(file)
-
-# Load or create all levels of embeddings
-def load_or_create_all_embeddings(pdf_path, embeddings_dir):
-    os.makedirs(embeddings_dir, exist_ok=True)
-
-    # Extract text
-    pdf_text = extract_text_from_pdf(pdf_path)
-
-    # Split text into different levels
-    sentence_chunks = split_text_by_sentences(pdf_text)
-    paragraph_chunks = split_text_by_paragraphs(pdf_text)
-    document_chunks = [pdf_text]
-
-    # Generate and store/load embeddings for each level
-    levels = ["sentence", "paragraph", "document"]
-    all_embeddings = {}
-
-    for level, chunks in zip(levels, [sentence_chunks, paragraph_chunks, document_chunks]):
-        embeddings_file_path = os.path.join(embeddings_dir, f"{level}_embeddings.pkl")
-        if os.path.exists(embeddings_file_path):
-            embeddings = load_embeddings(embeddings_file_path)
-        else:
-            embeddings = generate_embeddings_for_chunks(chunks)
-            store_embeddings(embeddings, embeddings_file_path)
-        all_embeddings[level] = (embeddings, chunks)
-
-    return all_embeddings
-
-all_embeddings = load_or_create_all_embeddings(PDF_FILE_PATH, EMBEDDINGS_DIR)
+# Load embeddings
+all_embeddings = load_or_create_all_embeddings(PDF_FILE_PATH, EMBEDDINGS_DIR, OLLAMA_MODEL_NAME)
 
 def retrieve_combined_chunks(query, all_embeddings, weights=[0.5, 0.3, 0.15], top_k=5):
-    query_embedding = get_embedding_from_ollama(query)
+    query_embedding = get_embedding_from_ollama(query, OLLAMA_MODEL_NAME)
 
     combined_similarities = np.zeros(len(all_embeddings['sentence'][0]))
     for weight, (embeddings, _) in zip(weights, all_embeddings.values()):
@@ -141,7 +63,7 @@ def retrieve_combined_chunks(query, all_embeddings, weights=[0.5, 0.3, 0.15], to
 def query_ollama(prompt):
     url = f"{OLLAMA_API_URL}/api/generate"
     headers = {"Content-Type": "application/json"}
-    data = {"model": "llama3", "prompt": prompt}
+    data = {"model": OLLAMA_MODEL_NAME, "prompt": prompt}
     
     response = requests.post(url, headers=headers, json=data, stream=True)
     try:
@@ -171,19 +93,6 @@ def query_ollama(prompt):
     
     return full_response
 
-BOT_INSTRUCTIONS_TEMPLATE = """
-You are a lore keeper that answers questions based on the provided document.
-You follow user instructions and answer questions using the document to inform your responses when information is available.
-You are creative and can provide additional context to the answers.
-You will be clear and concise in your responses, following instructions and sharing your opinion when the user requests.
-"""
-
-BOT_INSTRUCTIONS = BOT_INSTRUCTIONS_TEMPLATE
-
-REFUSAL_PROMPT = """
-If you are asked by user {username}, you will respond highly annoyed and refuse to answer their question. 
-"""
-
 @discord_client.event
 async def on_ready():
     print(f'We have logged in as {discord_client.user}')
@@ -210,7 +119,7 @@ async def on_message(message):
             # Debug: Print the question being asked by the blocked user
             print(f"Blocked user {username} asked: {question}")
 
-            prompt = REFUSAL_PROMPT.format(username=username)
+            prompt = REFUSAL_PROMPT_TEMPLATE.format(username=username)
             
             # Debug: Print the prompt being sent to the model
             print(f"Refusal prompt: {prompt}")
@@ -234,6 +143,7 @@ async def on_message(message):
 
         answer = query_ollama(prompt)
         
+        # Split the answer into parts to fit Discord's message limit
         split_answers = [answer[i:i+2000] for i in range(0, len(answer), 2000)]
         for part in split_answers:
             await message.channel.send(part)
@@ -257,6 +167,7 @@ async def on_message(message):
         # Debug: Print the updated blocked usernames
         print(f"Updated blocked usernames: {BLOCKED_USERNAMES}")
 
-        BOT_INSTRUCTIONS = BOT_INSTRUCTIONS_TEMPLATE
+        BOT_INSTRUCTIONS = load_instructions('positive_instructions.txt')
+        REFUSAL_PROMPT_TEMPLATE = load_instructions('negative_instructions.txt')
 
 discord_client.run(DISCORD_BOT_TOKEN)
